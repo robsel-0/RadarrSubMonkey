@@ -18,8 +18,6 @@ languages.
 
 ## Known bugs
 - Doesn't always work when filtering.
-- No rate limiting is done for the GET requests, which may lead to error 503 on
-  some sites.
 
 ## Dependencies
 - Tampermonkey or similar userscript manager.

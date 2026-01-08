@@ -17,8 +17,6 @@
  *
  * Known bugs:
  * - Doesn't always work when filtering.
- * - No rate limiting is done for the GET requests, which may lead to error 503
- *   on some sites.
  *
  * Dependencies:
  * - Tampermonkey or similar userscript manager.
@@ -49,7 +47,7 @@
 // ==UserScript==
 // @name         RadarrSubMonkey
 // @namespace    https://github.com/robsel-0/RadarrSubMonkey
-// @version      2026-01-07
+// @version      2026-01-08
 // @description  Try to take over the world!
 // @author       robsel-0
 // @icon         https://raw.githubusercontent.com/robsel-0/RadarrSubMonkey/refs/heads/master/icon64x64.png
@@ -72,6 +70,7 @@
 
     const nQueueWorkers = 5;
     const pageLoadTimeoutMs = 5000;
+    const waitBetweenFetchRequestsMs = 1000;
 
     const languageFlags = {
         swedish: '🇸🇪',
@@ -99,7 +98,7 @@
             this.#nWorkers = nWorkers;
         }
 
-        add(urlString, setStatus) {
+        addWork(urlString, setStatus) {
             this.#queue.push({ urlString: urlString, setStatus });
             this.#processQueue();
         }
@@ -231,11 +230,7 @@
     }
 
     function whenModalHeaderDivFound(modalHeaderDiv) {
-        log('ModalHeader div found');
-
         const modalContent = searchUpwardsForModalContent(modalHeaderDiv);
-        log('ModalContent div found:', modalContent);
-
         findAndCall(modalContent, findResultsTable, whenResultsTableFound);
     }
 
@@ -272,10 +267,10 @@
     }
 
     function whenResultsTableFound(table) {
-        log('Results table found: ', table);
         findAndCall(table, findThead, addSubtitleHeading);
         findAndCall(table, findTbody, whenTbodyFound);
     }
+
     ////////////////////////////////////////////////////////////////////////////
 
     function findThead(root) {
@@ -288,8 +283,6 @@
     }
 
     function addSubtitleHeading(thead) {
-        log('Thead found');
-
         const all_trs_in_thead = thead.querySelectorAll('tr');
         for (const tr of all_trs_in_thead) {
             const th = findLanguageThInThead(tr);
@@ -301,13 +294,10 @@
     }
 
     function findLanguageThInThead(tr) {
-        log('Searching for Language TH in THEAD TR');
-
         const ths = tr.getElementsByTagName('th');
         for (let i = 0; i < ths.length; i++) {
             const th = ths[i];
             if (th.textContent.trim().toLowerCase() === 'language') {
-                log('Language TH found in THEAD: ', th);
                 return th;
             }
         }
@@ -341,7 +331,7 @@
         const link = getLinkInTrAsString(tr);
         if (isAllowedHostname((new URL(link)).hostname)) {
             setStatus('◌');
-            workQueue.add(link, setStatus);
+            workQueue.addWork(link, setStatus);
         } else {
             setStatus('⛔');
         }
@@ -366,8 +356,6 @@
         const observerCallback = (entries, observer) => {
             entries.forEach(entry => {
                 if (entry.isIntersecting) {
-                    console.log('Element is visible on the screen');
-                    console.log('Type of element:', entry.target.tagName);
                     if (entry.target.tagName === 'TR') {
                         const tr = entry.target;
                         whenTrIsVisibleOnScreen(tr, observer);
@@ -436,7 +424,6 @@
     }
 
     function isAllowedHostname(hostname) {
-        log('Checking if hostname is allowed:', hostname);
         return matchDomains.includes(hostname) && connectDomains.includes(hostname);
     }
 
@@ -446,20 +433,34 @@
         // First try using GET. If that fails to find subtitles, try using iframe.
         let status = '';
 
-        const _setStatus = (str) => {
-            status = str;
-            setStatus(status);
+        const createDelayedCallback = (fn) => {
+            const delayedOnDone = () => {
+                setTimeout(() => {
+                    fn();
+                }, waitBetweenFetchRequestsMs);
+            };
+
+            return delayedOnDone;
         }
 
-        const _onDone = () => {
+        const saveStatus = (str) => {
+            status = str;
+        }
+
+        const onDoneUsingGet = () => {
             if (status === '❌') {
-                fetchLinkAndSearchForSubtitlesUsingIframe(urlString, setStatus, onDone);
+                fetchLinkAndSearchForSubtitlesUsingIframe(urlString,
+                    setStatus,
+                    createDelayedCallback(onDone));
             } else {
+                setStatus(status);
                 onDone();
             }
         };
 
-        fetchLinkAndSearchForSubtitlesUsingGet(urlString, _setStatus, _onDone);
+        fetchLinkAndSearchForSubtitlesUsingGet(urlString,
+            saveStatus,
+            createDelayedCallback(onDoneUsingGet));
     }
 
     function fetchLinkAndSearchForSubtitlesUsingIframe(urlString, setStatus = (str) => { }, onDone = () => { }) {
@@ -521,7 +522,6 @@
             method: 'GET',
             url: urlString,
             onload: (res) => {
-
                 if (res.status < 200 || res.status >= 300) {
                     log("Invalid return status: " + new Error(`HTTP ${res.status}`));
                     setText('HTTP ' + res.status);
@@ -536,14 +536,7 @@
                     return;
                 }
 
-                const lowerCaseContent = content.toLowerCase();
-                var flags = '';
-                for (const [lang, flag] of Object.entries(languageFlags)) {
-                    if (lowerCaseContent.includes(lang)) {
-                        flags += flag;
-                    }
-                }
-
+                var flags = parseContentForLanguageFlags(content);
                 setText(flags || '❌');
                 onDone();
             },
@@ -559,6 +552,19 @@
                 onDone();
             }
         });
+    }
+
+    function parseContentForLanguageFlags(content) {
+        const lowerCaseContent = content.toLowerCase();
+        var flags = '';
+
+        for (const [lang, flag] of Object.entries(languageFlags)) {
+            if (lowerCaseContent.includes(lang)) {
+                flags += flag;
+            }
+        }
+
+        return flags;
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -577,16 +583,9 @@
 
     function mainOther() {
         log("LOADED on other site: ", window.location.href);
-        log("RadarURL: ", radarrUrl);
 
-        const lowerCaseContent = document.body ? document.body.textContent.toLowerCase() : '';
-        var flags = '';
-        for (const [lang, flag] of Object.entries(languageFlags)) {
-            if (lowerCaseContent.includes(lang)) {
-                flags += flag;
-            }
-        }
-
+        const content = document.body ? document.body.textContent : '';
+        var flags = parseContentForLanguageFlags(content);
         flags = flags || '❌';
 
         const payload = { url: window.location.href, flags };
